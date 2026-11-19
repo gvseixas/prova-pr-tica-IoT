@@ -1,0 +1,476 @@
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include <SPI.h>
+#include <MFRC522.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <ESP32Servo.h>
+
+const char* WIFI_SSID = "Wokwi-GUEST";
+const char* WIFI_PASS = "";
+
+const char* MQTT_SERVER = "broker.mqtt.cool";
+const int MQTT_PORT = 1883;
+const char* MQTT_ROOT = "mango/esp32c3/paulo";
+
+String TOPIC_TELEMETRY = String(MQTT_ROOT) + "/telemetry";
+String TOPIC_RFID = String(MQTT_ROOT) + "/rfid";
+String TOPIC_COMMAND = String(MQTT_ROOT) + "/command";
+String TOPIC_GAME = String(MQTT_ROOT) + "/game";
+
+WiFiClient espClient;
+PubSubClient mqtt(espClient);
+
+#define SW1_PIN 6
+#define SW2_PIN 5
+#define SERVO1_PIN 10
+#define SERVO2_PIN 7
+
+#define RFID_SS 0
+#define RFID_RST 4
+#define RFID_SCK 1
+#define RFID_MOSI 2
+#define RFID_MISO 3
+
+#define OLED_SDA 18
+#define OLED_SCL 19
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_ADDR 0x3C
+
+MFRC522 rfid(RFID_SS, RFID_RST);
+Servo servo1, servo2;
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+int sw1State = -1, sw2State = -1;
+int servo1Angle = 90, servo2Angle = 90;
+
+String lastRFID = "";
+String line1 = "ESP32-C3";
+String line2 = "MQTT ONLINE";
+String line3 = "AGUARDANDO";
+
+String jogadaJ1 = "";
+String jogadaJ2 = "";
+String entradaSerial = "";
+
+int pontosJ1 = 0;
+int pontosJ2 = 0;
+
+bool resultadoNaTela = false;
+bool jogoEncerrado = false;
+
+unsigned long tempoResultado = 0;
+
+void updateDisplay() {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+
+  display.setCursor(0, 4);
+  display.println(line1);
+
+  display.setCursor(0, 24);
+  display.println(line2);
+
+  display.setCursor(0, 44);
+  display.println(line3);
+
+  display.display();
+}
+
+void connectWiFi() {
+  Serial.print("Conectando ao WiFi");
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("\nWiFi conectado!");
+  Serial.println(WiFi.localIP());
+}
+
+void publishTelemetry() {
+  if (!mqtt.connected()) return;
+
+  JsonDocument doc;
+
+  doc["sw1"] = sw1State;
+  doc["sw2"] = sw2State;
+
+  char buffer[128];
+  serializeJson(doc, buffer);
+
+  mqtt.publish(TOPIC_TELEMETRY.c_str(), buffer, true);
+
+  Serial.println(buffer);
+}
+
+void publishRFID(String uid) {
+  if (!mqtt.connected()) return;
+
+  JsonDocument doc;
+  doc["uid"] = uid;
+
+  char buffer[128];
+  serializeJson(doc, buffer);
+
+  mqtt.publish(TOPIC_RFID.c_str(), buffer, false);
+
+  Serial.println(buffer);
+}
+
+void publicarResultado(String resultado) {
+  if (!mqtt.connected()) {
+    Serial.println("MQTT desconectado!");
+    return;
+  }
+
+  JsonDocument doc;
+
+  doc["jogador1"] = jogadaJ1;
+  doc["jogador2"] = jogadaJ2;
+  doc["resultado"] = resultado;
+  doc["pontos_j1"] = pontosJ1;
+  doc["pontos_j2"] = pontosJ2;
+
+  char buffer[256];
+  serializeJson(doc, buffer);
+
+  mqtt.publish(TOPIC_GAME.c_str(), buffer, false);
+
+  Serial.println(buffer);
+}
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  JsonDocument doc;
+
+  if (deserializeJson(doc, payload, length)) {
+    Serial.println("Erro no JSON!");
+    return;
+  }
+
+  if (!doc["servo1"].isNull()) {
+    servo1Angle = constrain(doc["servo1"].as<int>(), 0, 180);
+    servo1.write(servo1Angle);
+  }
+
+  if (!doc["servo2"].isNull()) {
+    servo2Angle = constrain(doc["servo2"].as<int>(), 0, 180);
+    servo2.write(servo2Angle);
+  }
+
+  if (!doc["line1"].isNull())
+    line1 = doc["line1"].as<String>();
+
+  if (!doc["line2"].isNull())
+    line2 = doc["line2"].as<String>();
+
+  if (!doc["line3"].isNull())
+    line3 = doc["line3"].as<String>();
+
+  updateDisplay();
+}
+
+void connectMQTT() {
+  while (!mqtt.connected()) {
+    Serial.println("Conectando MQTT...");
+
+    String clientId = "ESP32C3-paulo-" + WiFi.macAddress();
+    clientId.replace(":", "");
+
+    if (mqtt.connect(clientId.c_str())) {
+      Serial.println("MQTT conectado!");
+
+      mqtt.subscribe(TOPIC_COMMAND.c_str());
+
+      sw1State = digitalRead(SW1_PIN);
+      sw2State = digitalRead(SW2_PIN);
+
+      publishTelemetry();
+
+      line2 = "MQTT CONECTADO";
+      updateDisplay();
+
+    } else {
+      Serial.println("Falha MQTT!");
+      delay(3000);
+    }
+  }
+}
+
+void readSwitches() {
+  int newSW1 = digitalRead(SW1_PIN);
+  int newSW2 = digitalRead(SW2_PIN);
+
+  if (newSW1 != sw1State || newSW2 != sw2State) {
+    sw1State = newSW1;
+    sw2State = newSW2;
+
+    publishTelemetry();
+  }
+}
+
+void readRFID() {
+  if (!rfid.PICC_IsNewCardPresent() ||
+      !rfid.PICC_ReadCardSerial()) return;
+
+  String uid = "";
+
+  for (byte i = 0; i < rfid.uid.size; i++) {
+    if (rfid.uid.uidByte[i] < 0x10) uid += "0";
+
+    uid += String(rfid.uid.uidByte[i], HEX);
+  }
+
+  uid.toUpperCase();
+
+  if (uid != lastRFID) {
+    lastRFID = uid;
+    publishRFID(uid);
+  }
+
+  rfid.PICC_HaltA();
+  rfid.PCD_StopCrypto1();
+}
+
+void mostrarInicioJogo() {
+  line1 = "PEDRA PAPEL TESOURA";
+  line2 = "J1: SUA VEZ";
+
+  line3 = "PLACAR " + String(pontosJ1) +
+          " x " + String(pontosJ2);
+
+  updateDisplay();
+
+  Serial.println("\nPEDRA, PAPEL E TESOURA");
+  Serial.println("Digite pedra, papel ou tesoura.");
+  Serial.println("Digite sair para encerrar.");
+  Serial.println("Digite reiniciar para zerar.");
+  Serial.println("Jogador 1:");
+}
+
+void mostrarAguardandoJogada() {
+  if (jogadaJ1 == "") {
+    line1 = "PEDRA PAPEL TESOURA";
+    line2 = "J1: SUA VEZ";
+  } else {
+    line1 = "J1: " + jogadaJ1;
+    line2 = "J2: SUA VEZ";
+  }
+
+  line3 = "PLACAR " + String(pontosJ1) +
+          " x " + String(pontosJ2);
+
+  updateDisplay();
+}
+
+void verificarJogadas() {
+  String resultado;
+
+  if (jogadaJ1 == jogadaJ2) {
+    resultado = "EMPATE";
+  }
+  else if (
+    (jogadaJ1 == "pedra" && jogadaJ2 == "tesoura") ||
+    (jogadaJ1 == "papel" && jogadaJ2 == "pedra") ||
+    (jogadaJ1 == "tesoura" && jogadaJ2 == "papel")
+  ) {
+    resultado = "JOGADOR 1 VENCEU";
+    pontosJ1++;
+  }
+  else {
+    resultado = "JOGADOR 2 VENCEU";
+    pontosJ2++;
+  }
+
+  Serial.println("\n========== RESULTADO ==========");
+  Serial.println("Jogador 1: " + jogadaJ1);
+  Serial.println("Jogador 2: " + jogadaJ2);
+  Serial.println(resultado);
+
+  Serial.println("PLACAR: " + String(pontosJ1) +
+                 " x " + String(pontosJ2));
+
+  line1 = "J1: " + jogadaJ1;
+  line2 = "J2: " + jogadaJ2;
+
+  if (resultado == "JOGADOR 1 VENCEU")
+    line3 = "J1 VENCEU " + String(pontosJ1) + "x" + String(pontosJ2);
+
+  else if (resultado == "JOGADOR 2 VENCEU")
+    line3 = "J2 VENCEU " + String(pontosJ1) + "x" + String(pontosJ2);
+
+  else
+    line3 = "EMPATE " + String(pontosJ1) + "x" + String(pontosJ2);
+
+  updateDisplay();
+
+  publicarResultado(resultado);
+
+  resultadoNaTela = true;
+  tempoResultado = millis();
+}
+
+void processarJogada(String entrada) {
+  entrada.trim();
+  entrada.toLowerCase();
+
+  if (entrada == "") return;
+
+  if (entrada == "reiniciar") {
+    pontosJ1 = 0;
+    pontosJ2 = 0;
+
+    jogadaJ1 = "";
+    jogadaJ2 = "";
+
+    resultadoNaTela = false;
+    jogoEncerrado = false;
+
+    mostrarInicioJogo();
+    return;
+  }
+
+  if (entrada == "sair") {
+    jogoEncerrado = true;
+
+    line1 = "FIM DE JOGO";
+    line2 = "J1 " + String(pontosJ1) +
+            " x J2 " + String(pontosJ2);
+    line3 = "DIGITE REINICIAR";
+
+    updateDisplay();
+
+    publicarResultado("FIM DE JOGO");
+    return;
+  }
+
+  if (jogoEncerrado) {
+    Serial.println("Jogo encerrado. Digite reiniciar.");
+    return;
+  }
+
+  if (resultadoNaTela) {
+    Serial.println("Aguarde a proxima rodada.");
+    return;
+  }
+
+  if (entrada != "pedra" &&
+      entrada != "papel" &&
+      entrada != "tesoura") {
+    Serial.println("Jogada invalida!");
+    mostrarAguardandoJogada();
+    return;
+  }
+
+  if (jogadaJ1 == "") {
+    jogadaJ1 = entrada;
+
+    Serial.println("Jogador 1: " + jogadaJ1);
+    Serial.println("Jogador 2:");
+
+    mostrarAguardandoJogada();
+  }
+  else {
+    jogadaJ2 = entrada;
+
+    Serial.println("Jogador 2: " + jogadaJ2);
+
+    verificarJogadas();
+  }
+}
+
+void lerJogoSerial() {
+  while (Serial.available()) {
+    char caractere = Serial.read();
+
+    if (caractere == '\n') {
+      processarJogada(entradaSerial);
+      entradaSerial = "";
+    }
+    else if (caractere != '\r') {
+      entradaSerial += caractere;
+    }
+  }
+}
+
+void atualizarJogo() {
+  if (resultadoNaTela && millis() - tempoResultado >= 3000) {
+    jogadaJ1 = "";
+    jogadaJ2 = "";
+
+    resultadoNaTela = false;
+
+    mostrarAguardandoJogada();
+
+    Serial.println("\nProxima rodada!");
+    Serial.println("Jogador 1:");
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(SW1_PIN, INPUT_PULLUP);
+  pinMode(SW2_PIN, INPUT_PULLUP);
+
+  Wire.begin(OLED_SDA, OLED_SCL);
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR))
+    Serial.println("Erro OLED!");
+
+  updateDisplay();
+
+  servo1.setPeriodHertz(50);
+  servo2.setPeriodHertz(50);
+
+  servo1.attach(SERVO1_PIN, 500, 2400);
+  servo2.attach(SERVO2_PIN, 500, 2400);
+
+  servo1.write(servo1Angle);
+  servo2.write(servo2Angle);
+
+  SPI.begin(RFID_SCK, RFID_MISO, RFID_MOSI, RFID_SS);
+  rfid.PCD_Init();
+
+  Serial.println("RFID inicializado!");
+
+  connectWiFi();
+
+  mqtt.setServer(MQTT_SERVER, MQTT_PORT);
+  mqtt.setCallback(mqttCallback);
+  mqtt.setBufferSize(512);
+
+  connectMQTT();
+
+  Serial.println("Sistema iniciado!");
+
+  mostrarInicioJogo();
+}
+
+void loop() {
+  if (WiFi.status() != WL_CONNECTED)
+    connectWiFi();
+
+  if (!mqtt.connected())
+    connectMQTT();
+
+  mqtt.loop();
+
+  lerJogoSerial();
+  atualizarJogo();
+
+  readSwitches();
+  readRFID();
+
+  delay(20);
+}
